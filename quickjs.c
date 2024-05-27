@@ -188,6 +188,7 @@ typedef enum JSErrorEnum {
     JS_AGGREGATE_ERROR,
 
     JS_NATIVE_ERROR_COUNT, /* number of different NativeError objects */
+    JS_PLAIN_ERROR = JS_NATIVE_ERROR_COUNT
 } JSErrorEnum;
 
 #define JS_MAX_LOCAL_VARS 65535
@@ -6641,8 +6642,11 @@ static JSValue JS_ThrowError2(JSContext *ctx, JSErrorEnum error_num,
     JSValue obj, ret, msg;
 
     vsnprintf(buf, sizeof(buf), fmt, ap);
-    obj = JS_NewObjectProtoClass(ctx, ctx->native_error_proto[error_num],
-                                 JS_CLASS_ERROR);
+    if (error_num == JS_PLAIN_ERROR)
+        obj = JS_NewError(ctx);
+    else
+        obj = JS_NewObjectProtoClass(ctx, ctx->native_error_proto[error_num],
+                                     JS_CLASS_ERROR);
     if (unlikely(JS_IsException(obj))) {
         /* out of memory: throw JS_NULL to avoid recursing */
         obj = JS_NULL;
@@ -6674,6 +6678,17 @@ static JSValue JS_ThrowError(JSContext *ctx, JSErrorEnum error_num,
     add_backtrace = !rt->in_out_of_memory &&
         (!sf || (JS_GetFunctionBytecode(sf->cur_func) == NULL));
     return JS_ThrowError2(ctx, error_num, fmt, ap, add_backtrace);
+}
+
+JSValue __attribute__((format(printf, 2, 3))) JS_ThrowPlainError(JSContext *ctx, const char *fmt, ...)
+{
+    JSValue val;
+    va_list ap;
+
+    va_start(ap, fmt);
+    val = JS_ThrowError(ctx, JS_PLAIN_ERROR, fmt, ap);
+    va_end(ap);
+    return val;
 }
 
 JSValue __attribute__((format(printf, 2, 3))) JS_ThrowSyntaxError(JSContext *ctx, const char *fmt, ...)
@@ -7008,6 +7023,10 @@ static JSValue JS_GetPrototypeFree(JSContext *ctx, JSValue obj)
     obj1 = JS_GetPrototype(ctx, obj);
     JS_FreeValue(ctx, obj);
     return obj1;
+}
+
+int JS_GetLength(JSContext *ctx, JSValue obj, int64_t *pres) {
+    return js_get_length64(ctx, pres, obj);
 }
 
 /* return TRUE, FALSE or (-1) in case of exception */
@@ -7846,6 +7865,12 @@ int JS_GetOwnProperty(JSContext *ctx, JSPropertyDescriptor *desc,
         return -1;
     }
     return JS_GetOwnPropertyInternal(ctx, desc, JS_VALUE_GET_OBJ(obj), prop);
+}
+
+void JS_FreePropertyEnum(JSContext *ctx, JSPropertyEnum *tab,
+                         uint32_t len)
+{
+    js_free_prop_enum(ctx, tab, len);
 }
 
 /* return -1 if exception (Proxy object only) or TRUE/FALSE */
@@ -10089,7 +10114,7 @@ static int skip_spaces(const char *pc)
             if (!((c >= 0x09 && c <= 0x0d) || (c == 0x20)))
                 break;
         } else {
-            c = utf8_decode(p - 1, UTF8_CHAR_LEN_MAX, &p_next);
+            c = utf8_decode(p - 1, &p_next);
             /* no need to test for invalid UTF-8, 0xFFFD is not a space */
             if (!lre_is_space(c))
                 break;
@@ -10178,17 +10203,18 @@ static JSValue js_string_to_bigint(JSContext *ctx, const char *buf, int radix)
     return JS_CompactBigInt1(ctx, val);
 }
 
-/* `js_atof(ctx, p, end, pp, radix, flags)`
+/* `js_atof(ctx, p, len, pp, radix, flags)`
+   Convert the string pointed to by `p` to a number value.
    Return an exception in case of memory error.
    Return `JS_NAN` if invalid syntax.
-   - `p` points to a null terminated UTF-8 encoded char array
-   - `end` points to the end of the array.
-   - `pp` if not null receives a pointer to the next character
-   - `radix` must be in range 2 to 36, else return `JS_NAN`
-   - `flags` is a combination of the flags below
-   There is a null byte at `*end`, but there might be embedded null bytes
-   between `p` and `end` which must produce `JS_NAN` if the
-   `ATOD_NO_TRAILING_CHARS` flag is not present.
+   - `p` points to a null terminated UTF-8 encoded char array,
+   - `len` the length of the array,
+   - `pp` if not null receives a pointer to the next character,
+   - `radix` must be in range 2 to 36, else return `JS_NAN`.
+   - `flags` is a combination of the flags below.
+   There is a null byte at `p[len]`, but there might be embedded null
+   bytes between `p[0]` and `p[len]` which must produce `JS_NAN` if
+   the `ATOD_NO_TRAILING_CHARS` flag is present.
  */
 
 #define ATOD_TRIM_SPACES         (1 << 0)   /* trim white space */
@@ -10203,14 +10229,15 @@ static JSValue js_string_to_bigint(JSContext *ctx, const char *buf, int radix)
 #define ATOD_DECIMAL_AFTER_SIGN  (1 << 9)   /* only accept decimal number after sign */
 #define ATOD_NO_TRAILING_CHARS   (1 << 10)  /* do not accept trailing characters */
 
-static JSValue js_atof(JSContext *ctx, const char *p, const char *end,
+static JSValue js_atof(JSContext *ctx, const char *p, size_t len,
                        const char **pp, int radix, int flags)
 {
     const char *p_start;
+    const char *end = p + len;
     int sep;
     BOOL is_float;
     char buf1[64], *buf = buf1;
-    size_t i, j, len;
+    size_t i, j;
     JSValue val = JS_NAN;
     double d;
     char sign;
@@ -10392,7 +10419,7 @@ static JSValue JS_ToNumberHintFree(JSContext *ctx, JSValue val,
                 ATOD_ACCEPT_FLOAT | ATOD_ACCEPT_INFINITY |
                 ATOD_ACCEPT_HEX_PREFIX | ATOD_ACCEPT_BIN_OCT |
                 ATOD_DECIMAL_AFTER_SIGN | ATOD_NO_TRAILING_CHARS;
-            ret = js_atof(ctx, str, str + len, NULL, 10, flags);
+            ret = js_atof(ctx, str, len, NULL, 10, flags);
             JS_FreeCString(ctx, str);
         }
         break;
@@ -10976,6 +11003,7 @@ static JSValue js_bigint_to_string1(JSContext *ctx, JSValue val, int radix)
     bf_t a_s, *a;
     char *str;
     int saved_sign;
+    size_t len;
 
     a = JS_ToBigInt(ctx, &a_s, val);
     if (!a)
@@ -10983,14 +11011,13 @@ static JSValue js_bigint_to_string1(JSContext *ctx, JSValue val, int radix)
     saved_sign = a->sign;
     if (a->expn == BF_EXP_ZERO)
         a->sign = 0;
-    // TODO(chqrlie) bf_ftoa should return the string length to the caller
-    str = bf_ftoa(NULL, a, radix, 0, BF_RNDZ | BF_FTOA_FORMAT_FRAC |
+    str = bf_ftoa(&len, a, radix, 0, BF_RNDZ | BF_FTOA_FORMAT_FRAC |
                   BF_FTOA_JS_QUIRKS);
     a->sign = saved_sign;
     JS_FreeBigInt(ctx, a, &a_s);
     if (!str)
         return JS_ThrowOutOfMemory(ctx);
-    ret = js_new_string8(ctx, str);
+    ret = js_new_string8_len(ctx, str, len);
     bf_free(ctx->bf_ctx, str);
     return ret;
 }
@@ -11918,7 +11945,7 @@ static JSValue JS_StringToBigInt(JSContext *ctx, JSValue val)
         ATOD_TRIM_SPACES | ATOD_ACCEPT_EMPTY |
         ATOD_ACCEPT_HEX_PREFIX | ATOD_ACCEPT_BIN_OCT |
         ATOD_DECIMAL_AFTER_SIGN | ATOD_NO_TRAILING_CHARS;
-    val = js_atof(ctx, str, str + len, NULL, 10, flags);
+    val = js_atof(ctx, str, len, NULL, 10, flags);
     JS_FreeCString(ctx, str);
     return val;
 }
@@ -18764,7 +18791,7 @@ static __exception int js_parse_template_part(JSParseState *s,
             s->eol = &p[-1];
             s->mark = p;
         } else if (c >= 0x80) {
-            c = utf8_decode(p - 1, UTF8_CHAR_LEN_MAX, &p_next);
+            c = utf8_decode(p - 1, &p_next);
             if (p_next == p) {
                 js_parse_error(s, "invalid UTF-8 sequence");
                 goto fail;
@@ -18870,7 +18897,7 @@ static __exception int js_parse_string(JSParseState *s, int sep,
                     }
                     goto fail;
                 } else if (c >= 0x80) {
-                    c = utf8_decode(p, UTF8_CHAR_LEN_MAX, &p_next);
+                    c = utf8_decode(p, &p_next);
                     if (p_next == p + 1) {
                         goto invalid_utf8;
                     }
@@ -18896,7 +18923,7 @@ static __exception int js_parse_string(JSParseState *s, int sep,
                 break;
             }
         } else if (c >= 0x80) {
-            c = utf8_decode(p - 1, UTF8_CHAR_LEN_MAX, &p_next);
+            c = utf8_decode(p - 1, &p_next);
             if (p_next == p)
                 goto invalid_utf8;
             p = p_next;
@@ -18968,7 +18995,7 @@ static __exception int js_parse_regexp(JSParseState *s)
             else if (c == '\0' && p >= s->buf_end)
                 goto eof_error;
             else if (c >= 0x80) {
-                c = utf8_decode(p - 1, UTF8_CHAR_LEN_MAX, &p_next);
+                c = utf8_decode(p - 1, &p_next);
                 if (p_next == p) {
                     goto invalid_utf8;
                 }
@@ -18977,7 +19004,7 @@ static __exception int js_parse_regexp(JSParseState *s)
                     goto eol_error;
             }
         } else if (c >= 0x80) {
-            c = utf8_decode(p - 1, UTF8_CHAR_LEN_MAX, &p_next);
+            c = utf8_decode(p - 1, &p_next);
             if (p_next == p) {
             invalid_utf8:
                 js_parse_error(s, "invalid UTF-8 sequence");
@@ -18997,7 +19024,7 @@ static __exception int js_parse_regexp(JSParseState *s)
 
     /* flags */
     for(;;) {
-        c = utf8_decode(p, UTF8_CHAR_LEN_MAX, &p_next);
+        c = utf8_decode(p, &p_next);
         /* no need to test for invalid UTF-8, 0xFFFD is not ident_next */
         if (!lre_js_is_ident_next(c))
             break;
@@ -19071,7 +19098,7 @@ static JSAtom parse_ident(JSParseState *s, const uint8_t **pp,
             c = lre_parse_escape(&p_next, TRUE);
             *pident_has_escape = TRUE;
         } else if (c >= 0x80) {
-            c = utf8_decode(p, UTF8_CHAR_LEN_MAX, &p_next);
+            c = utf8_decode(p, &p_next);
             /* no need to test for invalid UTF-8, 0xFFFD is not ident_next */
         }
         if (!lre_js_is_ident_next(c))
@@ -19175,7 +19202,7 @@ static __exception int next_token(JSParseState *s)
                     s->got_lf = TRUE; /* considered as LF for ASI */
                     p++;
                 } else if (*p >= 0x80) {
-                    c = utf8_decode(p, UTF8_CHAR_LEN_MAX, &p);
+                    c = utf8_decode(p, &p);
                     /* ignore invalid UTF-8 in comments */
                     if (c == CP_LS || c == CP_PS) {
                         s->got_lf = TRUE; /* considered as LF for ASI */
@@ -19196,7 +19223,7 @@ static __exception int next_token(JSParseState *s)
                 if (*p == '\r' || *p == '\n')
                     break;
                 if (*p >= 0x80) {
-                    c = utf8_decode(p, UTF8_CHAR_LEN_MAX, &p);
+                    c = utf8_decode(p, &p);
                     /* ignore invalid UTF-8 in comments */
                     /* LS or PS are considered as line terminator */
                     if (c == CP_LS || c == CP_PS) {
@@ -19296,7 +19323,7 @@ static __exception int next_token(JSParseState *s)
             if (c == '\\' && *p_next == 'u') {
                 c = lre_parse_escape(&p_next, TRUE);
             } else if (c >= 0x80) {
-                c = utf8_decode(p, UTF8_CHAR_LEN_MAX, &p_next);
+                c = utf8_decode(p, &p_next);
                 if (p_next == p + 1)
                     goto invalid_utf8;
             }
@@ -19357,18 +19384,19 @@ static __exception int next_token(JSParseState *s)
         /* number */
         {
             JSValue ret;
-            const uint8_t *p1;
+            const char *p1;
 
             flags = ATOD_ACCEPT_FLOAT | ATOD_ACCEPT_UNDERSCORES | ATOD_ACCEPT_SUFFIX;
             radix = 10;
         parse_number:
-            ret = js_atof(s->ctx, (const char *)p, (const char *)s->buf_end,
-                          (const char **)&p, radix, flags);
+            p1 = (const char *)p;
+            ret = js_atof(s->ctx, p1, s->buf_end - p, &p1, radix, flags);
+            p = (const uint8_t *)p1;
             if (JS_IsException(ret))
                 goto fail;
             /* reject `10instanceof Number` */
             if (JS_VALUE_IS_NAN(ret) ||
-                lre_js_is_ident_next(utf8_decode(p, UTF8_CHAR_LEN_MAX, &p_next))) {
+                lre_js_is_ident_next(utf8_decode(p, &p_next))) {
                 JS_FreeValue(s->ctx, ret);
                 js_parse_error(s, "invalid number literal");
                 goto fail;
@@ -19561,7 +19589,7 @@ static __exception int next_token(JSParseState *s)
         break;
     default:
         if (c >= 0x80) {  /* non-ASCII code-point */
-            c = utf8_decode(p, UTF8_CHAR_LEN_MAX, &p_next);
+            c = utf8_decode(p, &p_next);
             if (p_next == p + 1)
                 goto invalid_utf8;
             p = p_next;
@@ -19671,7 +19699,7 @@ static int json_parse_string(JSParseState *s, const uint8_t **pp)
             }
         } else
         if (c >= 0x80) {
-            c = utf8_decode(p - 1, s->buf_end - p, &p_next);
+            c = utf8_decode(p - 1, &p_next);
             if (p_next == p) {
                 json_parse_error(s, p - 1, "Bad UTF-8 sequence");
                 goto fail;
@@ -19875,7 +19903,7 @@ static __exception int json_next_token(JSParseState *s)
         break;
     default:
         if (c >= 0x80) {
-            c = utf8_decode(p, s->buf_end - p, &p_next);
+            c = utf8_decode(p, &p_next);
             if (p_next == p + 1) {
                 js_parse_error(s, "Unexpected token '\\x%02x' in JSON", *p);
             } else {
@@ -19998,7 +20026,7 @@ static void skip_shebang(const uint8_t **pp, const uint8_t *buf_end)
             if (*p == '\n' || *p == '\r') {
                 break;
             } else if (*p >= 0x80) {
-                c = utf8_decode(p, UTF8_CHAR_LEN_MAX, &p);
+                c = utf8_decode(p, &p);
                 /* purposely ignore UTF-8 encoding errors in this comment line */
                 if (c == CP_LS || c == CP_PS)
                     break;
@@ -39232,7 +39260,7 @@ static JSValue js_parseInt(JSContext *ctx, JSValue this_val,
         flags |= ATOD_ACCEPT_HEX_PREFIX;  // Only 0x and 0X are supported
         radix = 10;
     }
-    ret = js_atof(ctx, str, str + len, NULL, radix, flags);
+    ret = js_atof(ctx, str, len, NULL, radix, flags);
     JS_FreeCString(ctx, str);
     return ret;
 }
@@ -39249,7 +39277,7 @@ static JSValue js_parseFloat(JSContext *ctx, JSValue this_val,
     if (!str)
         return JS_EXCEPTION;
     flags = ATOD_TRIM_SPACES | ATOD_ACCEPT_FLOAT | ATOD_ACCEPT_INFINITY;
-    ret = js_atof(ctx, str, str + len, NULL, 10, flags);
+    ret = js_atof(ctx, str, len, NULL, 10, flags);
     JS_FreeCString(ctx, str);
     return ret;
 }
