@@ -1796,11 +1796,6 @@ void JS_SetGCThreshold(JSRuntime *rt, size_t gc_threshold)
     rt->malloc_gc_threshold = gc_threshold;
 }
 
-size_t JS_GetGCThreshold(JSRuntime *rt)
-{
-    return rt->malloc_gc_threshold;
-}
-
 void JS_SetGCThresholdFixed(JSRuntime *rt, BOOL fix)
 {
     rt->malloc_gc_fix_threshold = fix;
