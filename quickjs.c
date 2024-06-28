@@ -2223,15 +2223,13 @@ static inline void set_value(JSContext *ctx, JSValue *pval, JSValue new_val)
 
 void JS_SetClassProto(JSContext *ctx, JSClassID class_id, JSValue obj)
 {
-    JSRuntime *rt = ctx->rt;
-    assert(class_id < rt->class_count);
+    assert(class_id < ctx->rt->class_count);
     set_value(ctx, &ctx->class_proto[class_id], obj);
 }
 
 JSValue JS_GetClassProto(JSContext *ctx, JSClassID class_id)
 {
-    JSRuntime *rt = ctx->rt;
-    assert(class_id < rt->class_count);
+    assert(class_id < ctx->rt->class_count);
     return js_dup(ctx->class_proto[class_id]);
 }
 
@@ -11118,8 +11116,6 @@ static int js_ecvt(double d, int n_digits,
                    char dest[minimum_length(JS_ECVT_BUF_SIZE)],
                    size_t size, int *decpt)
 {
-    int i;
-
     if (n_digits == 0) {
         /* find the minimum number of digits (XXX: inefficient but simple) */
         // TODO(chqrlie) use direct method from quickjs-printf
@@ -11169,7 +11165,7 @@ static int js_ecvt(double d, int n_digits,
                 return n_digits;    /* truncate the 2 extra digits */
         }
         /* round up in the string */
-        for(i = n_digits;; i--) {
+        for(int i = n_digits;; i--) {
             /* ignore the locale specific decimal point */
             if (is_digit(dest[i])) {
                 if (dest[i]++ < '9')
@@ -11199,7 +11195,7 @@ static size_t js_fcvt(double d, int n_digits,
                       char dest[minimum_length(JS_FCVT_BUF_SIZE)], size_t size)
 {
 #if defined(FE_DOWNWARD) && defined(FE_TONEAREST)
-    int i, n1, n2;
+    int i, n1;
     /* generate 2 extra digits: 99% chances to avoid 2 calls */
     n1 = snprintf(dest, size, "%.*f", n_digits + 2, d) - 2;
     if (dest[n1] >= '5') {
@@ -11462,7 +11458,6 @@ done:
 JSValue JS_ToStringInternal(JSContext *ctx, JSValue val, BOOL is_ToPropertyKey)
 {
     uint32_t tag;
-    const char *str;
     char buf[32];
     size_t len;
 
@@ -12096,8 +12091,7 @@ static JSValue JS_CompactBigInt1(JSContext *ctx, JSValue val)
         return val; /* fail safe */
     bf_t *a = JS_GetBigInt(val);
     if (a->expn == BF_EXP_ZERO && a->sign) {
-        JSBigInt *p = JS_VALUE_GET_PTR(val);
-        assert(p->header.ref_count == 1);
+        assert(((JSBigInt*)JS_VALUE_GET_PTR(val))->header.ref_count == 1);
         a->sign = 0;
     }
     return val;
@@ -16895,6 +16889,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValue func_obj,
             }
             BREAK;
         CASE(OP_delete):
+            sf->cur_pc = pc;
             if (js_operator_delete(ctx, sp))
                 goto exception;
             sp--;
@@ -18864,7 +18859,6 @@ static __exception int js_parse_string(JSParseState *s, int sep,
             break;
         }
         if (c == '\\') {
-            const uint8_t *p0 = p;
             c = *p;
             switch(c) {
             case '\0':
@@ -27064,7 +27058,6 @@ static JSValue js_dynamic_import_job(JSContext *ctx,
     JSValue *resolving_funcs = argv;
     JSValue basename_val = argv[2];
     JSValue specifier = argv[3];
-    JSModuleDef *m;
     const char *basename = NULL, *filename;
     JSValue ret, err;
 
@@ -27405,7 +27398,7 @@ static int js_inner_module_evaluation(JSContext *ctx, JSModuleDef *m,
         JSReqModuleEntry *rme = &m->req_module_entries[i];
         m1 = rme->module;
         index = js_inner_module_evaluation(ctx, m1, index, pstack_top, pvalue);
-        if (index < 0) 
+        if (index < 0)
             return -1;
         assert(m1->status == JS_MODULE_STATUS_EVALUATING ||
                m1->status == JS_MODULE_STATUS_EVALUATING_ASYNC ||
@@ -32996,11 +32989,10 @@ JSValue JS_EvalThis(JSContext *ctx, JSValue this_obj,
                     const char *input, size_t input_len,
                     const char *filename, int eval_flags)
 {
-    int eval_type = eval_flags & JS_EVAL_TYPE_MASK;
     JSValue ret;
 
-    assert(eval_type == JS_EVAL_TYPE_GLOBAL ||
-           eval_type == JS_EVAL_TYPE_MODULE);
+    assert((eval_flags & JS_EVAL_TYPE_MASK) == JS_EVAL_TYPE_GLOBAL ||
+           (eval_flags & JS_EVAL_TYPE_MASK) == JS_EVAL_TYPE_MODULE);
     ret = JS_EvalInternal(ctx, this_obj, input, input_len, filename,
                           eval_flags, -1);
     return ret;
@@ -34434,8 +34426,6 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
     int idx, i, local_count, has_debug_info;
     int function_size, cpool_offset, byte_code_offset;
     int closure_var_offset, vardefs_offset;
-    uint32_t ic_len;
-    JSAtom atom;
 
     memset(&bc, 0, sizeof(bc));
     bc.header.ref_count = 1;
@@ -37693,8 +37683,6 @@ static JSValue js_array_at(JSContext *ctx, JSValue this_val,
 {
     JSValue obj, ret;
     int64_t len, idx;
-    JSValue *arrp;
-    uint32_t count;
 
     ret = JS_EXCEPTION;
     obj = JS_ToObject(ctx, this_val);
@@ -47797,7 +47785,7 @@ static int64_t math_mod(int64_t a, int64_t b) {
     return m + (m < 0) * b;
 }
 
-static int64_t floor_div(int64_t a, int64_t b) {
+static int64_t floor_div_int64(int64_t a, int64_t b) {
     /* integer division rounding toward -Infinity */
     int64_t m = a % b;
     return (a - (m + (m < 0) * b)) / b;
@@ -47831,8 +47819,8 @@ static JSValue JS_SetThisTimeValue(JSContext *ctx, JSValue this_val, double v)
 }
 
 static int64_t days_from_year(int64_t y) {
-    return 365 * (y - 1970) + floor_div(y - 1969, 4) -
-        floor_div(y - 1901, 100) + floor_div(y - 1601, 400);
+    return 365 * (y - 1970) + floor_div_int64(y - 1969, 4) -
+        floor_div_int64(y - 1901, 100) + floor_div_int64(y - 1601, 400);
 }
 
 static int64_t days_in_year(int64_t y) {
@@ -47842,7 +47830,7 @@ static int64_t days_in_year(int64_t y) {
 /* return the year, update days */
 static int64_t year_from_days(int64_t *days) {
     int64_t y, d1, nd, d = *days;
-    y = floor_div(d * 10000, 3652425) + 1970;
+    y = floor_div_int64(d * 10000, 3652425) + 1970;
     /* the initial approximation is very good, so only a few
        iterations are necessary */
     for(;;) {
@@ -52284,7 +52272,6 @@ static JSValue js_atomics_wait(JSContext *ctx,
     int32_t v32;
     void *ptr;
     int64_t timeout;
-    struct timespec ts;
     JSAtomicsWaiter waiter_s, *waiter;
     int ret, size_log2, res;
     double d;
@@ -53231,3 +53218,7 @@ static void _JS_AddIntrinsicCallSite(JSContext *ctx)
                                js_callsite_proto_funcs,
                                countof(js_callsite_proto_funcs));
 }
+
+#undef malloc
+#undef free
+#undef realloc
