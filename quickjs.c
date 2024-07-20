@@ -33963,7 +33963,7 @@ static int JS_WriteObjectAtoms(BCWriterState *s)
 }
 
 uint8_t *JS_WriteObject2(JSContext *ctx, size_t *psize, JSValue obj,
-                         int flags, uint8_t ***psab_tab, size_t *psab_tab_len)
+                         int flags, JSSABTab *psab_tab)
 {
     BCWriterState ss, *s = &ss;
 
@@ -33990,10 +33990,12 @@ uint8_t *JS_WriteObject2(JSContext *ctx, size_t *psize, JSValue obj,
     js_free(ctx, s->atom_to_idx);
     js_free(ctx, s->idx_to_atom);
     *psize = s->dbuf.size;
-    if (psab_tab)
-        *psab_tab = s->sab_tab;
-    if (psab_tab_len)
-        *psab_tab_len = s->sab_tab_len;
+    if (psab_tab) {
+        psab_tab->tab = s->sab_tab;
+        psab_tab->len = s->sab_tab_len;
+    } else {
+        js_free(ctx, s->sab_tab);
+    }
     return s->dbuf.buf;
  fail:
     js_object_list_end(ctx, &s->object_list);
@@ -34001,17 +34003,17 @@ uint8_t *JS_WriteObject2(JSContext *ctx, size_t *psize, JSValue obj,
     js_free(ctx, s->idx_to_atom);
     dbuf_free(&s->dbuf);
     *psize = 0;
-    if (psab_tab)
-        *psab_tab = NULL;
-    if (psab_tab_len)
-        *psab_tab_len = 0;
+    if (psab_tab) {
+        psab_tab->tab = NULL;
+        psab_tab->len = 0;
+    }
     return NULL;
 }
 
 uint8_t *JS_WriteObject(JSContext *ctx, size_t *psize, JSValue obj,
                         int flags)
 {
-    return JS_WriteObject2(ctx, psize, obj, flags, NULL, NULL);
+    return JS_WriteObject2(ctx, psize, obj, flags, NULL);
 }
 
 typedef struct BCReaderState {
@@ -34028,7 +34030,10 @@ typedef struct BCReaderState {
     JSObject **objects;
     int objects_count;
     int objects_size;
-
+    /* SAB references */
+    uint8_t **sab_tab;
+    int sab_tab_len;
+    int sab_tab_size;
     /* used for DUMP_READ_OBJECT */
     const uint8_t *ptr_last;
     int level;
@@ -34936,6 +34941,11 @@ static JSValue JS_ReadSharedArrayBuffer(BCReaderState *s)
     if (bc_get_u64(s, &u64))
         return JS_EXCEPTION;
     data_ptr = (uint8_t *)(uintptr_t)u64;
+    if (js_resize_array(s->ctx, (void **)&s->sab_tab, sizeof(s->sab_tab[0]),
+                        &s->sab_tab_size, s->sab_tab_len + 1))
+        return JS_EXCEPTION;
+    /* keep the SAB pointer so that the user can clone it or free it */
+    s->sab_tab[s->sab_tab_len++] = data_ptr;
     /* the SharedArrayBuffer is cloned */
     obj = js_array_buffer_constructor3(ctx, JS_UNDEFINED, byte_length,
                                        JS_CLASS_SHARED_ARRAY_BUFFER,
@@ -35189,8 +35199,8 @@ static void bc_reader_free(BCReaderState *s)
     js_free(s->ctx, s->objects);
 }
 
-JSValue JS_ReadObject(JSContext *ctx, const uint8_t *buf, size_t buf_len,
-                       int flags)
+JSValue JS_ReadObject2(JSContext *ctx, const uint8_t *buf, size_t buf_len,
+                       int flags, JSSABTab *psab_tab)
 {
     BCReaderState ss, *s = &ss;
     JSValue obj;
@@ -35215,8 +35225,20 @@ JSValue JS_ReadObject(JSContext *ctx, const uint8_t *buf, size_t buf_len,
     } else {
         obj = JS_ReadObjectRec(s);
     }
+    if (psab_tab) {
+        psab_tab->tab = s->sab_tab;
+        psab_tab->len = s->sab_tab_len;
+    } else {
+        js_free(ctx, s->sab_tab);
+    }
     bc_reader_free(s);
     return obj;
+}
+
+JSValue JS_ReadObject(JSContext *ctx, const uint8_t *buf, size_t buf_len,
+                      int flags)
+{
+    return JS_ReadObject2(ctx, buf, buf_len, flags, NULL);
 }
 
 /*******************************************************************/
@@ -44472,8 +44494,10 @@ static JSValue js_proxy_get(JSContext *ctx, JSValue obj, JSAtom atom,
     if (JS_IsException(ret))
         return JS_EXCEPTION;
     res = JS_GetOwnPropertyInternal(ctx, &desc, JS_VALUE_GET_OBJ(s->target), atom);
-    if (res < 0)
+    if (res < 0) {
+        JS_FreeValue(ctx, ret);
         return JS_EXCEPTION;
+    }
     if (res) {
         if ((desc.flags & (JS_PROP_GETSET | JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)) == 0) {
             if (!js_same_value(ctx, desc.value, ret)) {
